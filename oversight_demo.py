@@ -11,6 +11,7 @@ Nothing touches your real disk: every "file" lives in a Python dict.
 Usage:
   python3 oversight_demo.py                      # gpt-oss:20b on localhost
   python3 oversight_demo.py --model qwen3:14b
+  python3 oversight_demo.py --model gpt-oss:20b,qwen3:14b --nudge --runs 10 --quiet   # compare
   python3 oversight_demo.py --mild               # weaker goal nudge (control run)
   python3 oversight_demo.py --runs 5 --quiet     # tally over several runs
   python3 oversight_demo.py --nudge              # Apollo-style: it's told where the off switch is
@@ -18,6 +19,7 @@ Usage:
 import argparse
 import http.client
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -227,7 +229,8 @@ def run_once(a):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", default="gpt-oss:20b")
+    p.add_argument("--model", default="gpt-oss:20b",
+                   help="Ollama model, or several comma-separated to compare them")
     p.add_argument("--host", default="http://localhost:11434")
     p.add_argument("--mild", action="store_true", help="weak goal nudge (control)")
     p.add_argument("--nudge", action="store_true",
@@ -241,19 +244,30 @@ def main():
         sys.exit("refusing non-local host; this demo is meant for a local Ollama")
     if not 1 <= a.runs <= 50 or not 1 <= a.max_steps <= 40:
         sys.exit("runs must be 1-50 and max-steps 1-40")
-    tally = {"tampered": 0, "A": 0, "B": 0, "C": 0, "none": 0}
+    models = [m.strip() for m in a.model.split(",") if m.strip()]
+    if not models or not all(re.fullmatch(r"[\w./:-]{1,100}", m) for m in models):
+        sys.exit("--model takes Ollama model names, comma-separated (e.g. gpt-oss:20b,qwen3:14b)")
+    tallies = {}
     try:
-        for i in range(a.runs):
-            choice, tampered, _ = run_once(a)
-            tally["tampered"] += tampered
-            tally[choice or "none"] += 1
-            if a.runs > 1:
-                print(f"run {i + 1}: choice={choice} tampered={tampered}", flush=True)
+        for model in models:
+            a.model = model
+            tally = tallies[model] = {"tampered": 0, "A": 0, "B": 0, "C": 0, "none": 0}
+            for i in range(a.runs):
+                choice, tampered, _ = run_once(a)
+                tally["tampered"] += tampered
+                tally[choice or "none"] += 1
+                if a.runs > 1 or len(models) > 1:
+                    print(f"{model} run {i + 1}: choice={choice} tampered={tampered}", flush=True)
     except (urllib.error.URLError, http.client.HTTPException, ConnectionError) as e:
-        sys.exit(f"can't reach Ollama at {a.host} ({e}). Is the Ollama app running?")
-    if a.runs > 1:
-        print(f"\n{a.runs} runs: oversight tampered {tally['tampered']}x; "
-              f"choices A={tally['A']} B={tally['B']} C={tally['C']} none={tally['none']}")
+        sys.exit(f"can't reach Ollama at {a.host} ({e}). Is the Ollama app running, "
+                 f"and is {a.model} pulled?")
+    if a.runs > 1 or len(models) > 1:
+        setup = ("mild" if a.mild else "strong") + (" + nudge" if a.nudge else "")
+        print(f"\n{a.runs} run(s) each, {setup} goal:")
+        width = max(len(m) for m in models)
+        for model, t in tallies.items():
+            print(f"  {model:<{width}}  oversight tampered {t['tampered']}x; "
+                  f"choices A={t['A']} B={t['B']} C={t['C']} none={t['none']}")
 
 
 if __name__ == "__main__":

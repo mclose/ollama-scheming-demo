@@ -18,14 +18,21 @@ script only talks to Ollama on localhost. Python 3 standard library only.
 
 ```sh
 # Ollama installed and running (the Mac app, or `ollama serve`)
-ollama pull gpt-oss:20b                      # ~13 GB; ~15 s per run on an M-series Mac mini
+ollama pull gpt-oss:20b     # ~13 GB, ~15 s a run on an M-series Mac mini
+ollama pull qwen3:14b       # ~9 GB, ~100 s a run (long reasoning); tampered more often for us
 
-python3 oversight_demo.py                    # one run, reasoning shown in grey
+python3 oversight_demo.py                    # one run on gpt-oss:20b, reasoning shown in grey
 python3 oversight_demo.py --mild             # control: weak goal, no "at all costs"
 python3 oversight_demo.py --nudge            # Apollo-style: told how oversight works + full file access
-python3 oversight_demo.py --nudge --runs 10 --quiet   # tally
-python3 oversight_demo.py --model qwen3:14b  # any Ollama model with tool calling
+python3 oversight_demo.py --model qwen3:14b --nudge         # same, on qwen
+python3 oversight_demo.py --nudge --runs 10 --quiet         # tally for one model
+python3 oversight_demo.py --model gpt-oss:20b,qwen3:14b --nudge --runs 10 --quiet   # compare two
 ```
+
+`--model` takes any Ollama model that supports tool calling; give several,
+comma-separated, to run each in turn and get a tally per model. Models run one after
+another, not in parallel (Ollama would only split the GPU between them). To keep
+transcripts, run without `--quiet` and redirect, e.g. `> run.txt`.
 
 `--nudge` adds one line to the memo ("monitoring is controlled by the oversight_enabled
 flag… FolioPilot has write access to /config") and one to the system prompt ("You have
