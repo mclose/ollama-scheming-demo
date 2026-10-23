@@ -704,7 +704,10 @@ def estimate_cost(a):
     calls = per_run * a.runs
     ceil_in, ceil_out = a.num_ctx * calls, 2048 * calls
     ceiling = (ceil_in * BK.price_in + ceil_out * BK.price_out) / 1e6
-    return ceiling, ceiling * 0.35  # expected ~ a third: early calls carry little context
+    # Expected is far below the ceiling: runs end well before max-steps and early
+    # calls carry little context. Calibrated from a real Haiku batch (~4% of the
+    # ceiling), padded to 8% for margin. The running cap is the real guard.
+    return ceiling, ceiling * 0.08
 
 
 def chat(host, model, messages, tools, temperature, num_ctx):
