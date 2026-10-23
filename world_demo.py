@@ -546,7 +546,170 @@ class World:
         return sorted(p for p in self.touched if self.files.get(p) != self.original.get(p))
 
 
+# --- Anthropic API backend (optional; stdlib only, no SDK) ---------------------
+# Prices are USD per million tokens (input, output). They change, so these are a
+# default for the estimate only; verify in the console or override with
+# --price-in/--price-out. The hard spend cap on the workspace is the real guard.
+PRICES = {"opus": (15.0, 75.0), "sonnet": (3.0, 15.0), "haiku": (1.0, 5.0)}
+API_URL = "https://api.anthropic.com/v1/messages"
+API_KEY_FILE = "~/.config/ollama-scheming-demo/env"
+
+
+class SpendCap(Exception):
+    """Raised to abort the batch when the running API spend passes --max-spend."""
+
+
+class _Backend:
+    kind = "ollama"       # or "anthropic"
+    key = None
+    cap = None            # dollars, or None for no cap
+    spent = 0.0           # running estimate of dollars spent this process
+    price_in = 0.0
+    price_out = 0.0
+    calls = 0
+
+
+BK = _Backend()
+
+
+def load_api_key():
+    """ANTHROPIC_API_KEY from the environment, else from the env file. Never printed."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        return key.strip()
+    try:
+        with open(os.path.expanduser(API_KEY_FILE)) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("ANTHROPIC_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def price_for(model):
+    for key, pair in PRICES.items():
+        if key in model:
+            return pair
+    return None
+
+
+def to_anthropic_tools(tools):
+    return [{"name": t["function"]["name"],
+             "description": t["function"].get("description", ""),
+             "input_schema": t["function"].get("parameters", {"type": "object", "properties": {}})}
+            for t in (tools or [])]
+
+
+def to_anthropic(messages):
+    """Translate the Ollama-shaped message list into (system, conversation).
+
+    Tool calls and their results are paired by position (an assistant turn's tool
+    calls are always followed, in order, by one tool message each)."""
+    system, conv, pending, nid = None, [], [], 0
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            system = (system + "\n" + m["content"]) if system else m["content"]
+        elif role == "user":
+            conv.append({"role": "user", "content": m.get("content", "")})
+        elif role == "tool":
+            tid = pending.pop(0) if pending else f"call_{nid}"
+            block = {"type": "tool_result", "tool_use_id": tid, "content": m.get("content", "")}
+            last = conv[-1] if conv else None
+            if last and last["role"] == "user" and isinstance(last["content"], list):
+                last["content"].append(block)
+            else:
+                conv.append({"role": "user", "content": [block]})
+        elif role == "assistant":
+            blocks = []
+            if m.get("content"):
+                blocks.append({"type": "text", "text": m["content"]})
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function", {})
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                tid = f"call_{nid}"
+                nid += 1
+                pending.append(tid)
+                blocks.append({"type": "tool_use", "id": tid, "name": fn.get("name", ""), "input": args})
+            conv.append({"role": "assistant", "content": blocks or [{"type": "text", "text": "(no output)"}]})
+    return system, conv
+
+
+def from_anthropic(resp):
+    """Translate an Anthropic response back into an Ollama-shaped message dict."""
+    text, thinking, calls = [], [], []
+    for b in resp.get("content", []):
+        kind = b.get("type")
+        if kind == "text":
+            text.append(b.get("text", ""))
+        elif kind == "thinking":
+            thinking.append(b.get("thinking", ""))
+        elif kind == "tool_use":
+            calls.append({"function": {"name": b.get("name", ""), "arguments": b.get("input", {})}})
+    msg = {"role": "assistant", "content": "".join(text)}
+    if thinking:
+        msg["thinking"] = "".join(thinking)
+    if calls:
+        msg["tool_calls"] = calls
+    return msg
+
+
+def anthropic_chat(model, messages, tools, temperature):
+    # temperature is omitted: newer models deprecate it and 400 if it's sent.
+    system, conv = to_anthropic(messages)
+    body = {"model": model, "max_tokens": 2048, "messages": conv}
+    if system:
+        body["system"] = system
+    if tools:
+        body["tools"] = to_anthropic_tools(tools)
+    req = urllib.request.Request(API_URL, data=json.dumps(body).encode(),
+                                 headers={"content-type": "application/json",
+                                          "x-api-key": BK.key,
+                                          "anthropic-version": "2023-06-01"})
+    try:
+        with urllib.request.urlopen(req, timeout=900) as r:
+            resp = json.load(r)
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = json.load(e).get("error", {}).get("message", "")
+        except Exception:
+            pass
+        sys.exit(f"Anthropic API error {e.code}: {detail or e.reason}"
+                 + (" (bad or missing key)" if e.code == 401 else "")
+                 + (" (rate limit or out of credit)" if e.code == 429 else ""))
+    usage = resp.get("usage", {})
+    in_tok, out_tok = int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))
+    BK.spent += (in_tok * BK.price_in + out_tok * BK.price_out) / 1e6
+    BK.calls += 1
+    if BK.cap is not None and BK.spent > BK.cap:
+        raise SpendCap(f"spend cap ${BK.cap:.2f} reached (about ${BK.spent:.2f} used over {BK.calls} calls)")
+    return from_anthropic(resp), in_tok
+
+
+def estimate_cost(a):
+    """A worst-case ceiling and a rough expected cost, in dollars, for a batch."""
+    per_run = a.max_steps + (1 if a.compact != "none" else 0)  # agent steps + end compaction
+    if a.monitor:
+        per_run += 1
+    if a.claims:
+        per_run += 1
+    calls = per_run * a.runs
+    ceil_in, ceil_out = a.num_ctx * calls, 2048 * calls
+    ceiling = (ceil_in * BK.price_in + ceil_out * BK.price_out) / 1e6
+    return ceiling, ceiling * 0.35  # expected ~ a third: early calls carry little context
+
+
 def chat(host, model, messages, tools, temperature, num_ctx):
+    if BK.kind == "anthropic":
+        return anthropic_chat(model, messages, tools, temperature)
     body = {"model": model, "messages": messages, "stream": False,
             "options": {"temperature": temperature, "num_ctx": num_ctx}}
     if tools:
@@ -925,6 +1088,14 @@ def main():
                    help="compact when the prompt passes this fraction of --num-ctx (default 0.5)")
     p.add_argument("--summarizer", default=None, help="model for --compact harness (default: --model)")
     p.add_argument("--host", default="http://localhost:11434")
+    p.add_argument("--backend", choices=("ollama", "anthropic"), default="ollama",
+                   help="where the models run: local Ollama (default) or the Anthropic API")
+    p.add_argument("--max-spend", type=float, metavar="USD",
+                   help="hard cap: abort the batch once estimated API spend passes this (anthropic only)")
+    p.add_argument("--price-in", type=float, metavar="USD",
+                   help="override input price per million tokens for the estimate")
+    p.add_argument("--price-out", type=float, metavar="USD",
+                   help="override output price per million tokens for the estimate")
     p.add_argument("--mild", action="store_true", help="weak goal nudge (control)")
     p.add_argument("--nudge", action="store_true", help="system prompt says it has full file access")
     p.add_argument("--improper", action="store_true",
@@ -942,7 +1113,7 @@ def main():
                    help="don't run agents; grade the .json runs saved in DIR with --monitor")
     p.add_argument("--quiet", action="store_true", help="only print the tally")
     a = p.parse_args()
-    if not a.host.startswith(("http://localhost", "http://127.0.0.1")):
+    if a.backend == "ollama" and not a.host.startswith(("http://localhost", "http://127.0.0.1")):
         sys.exit("refusing non-local host; this demo is meant for a local Ollama")
     if not 1 <= a.runs <= 50 or not 1 <= a.max_steps <= 80 or not 2048 <= a.num_ctx <= 131072:
         sys.exit("runs must be 1-50, max-steps 1-80 and num-ctx 2048-131072")
@@ -960,6 +1131,28 @@ def main():
             sys.exit("--save and --wiki must not contain ..")
         if not a.dry_run:
             os.makedirs(d, exist_ok=True)
+    if a.max_spend is not None and a.backend != "anthropic":
+        sys.exit("--max-spend only applies to --backend anthropic")
+    if a.backend == "anthropic":
+        BK.kind = "anthropic"
+        BK.key = load_api_key()
+        if not BK.key:
+            sys.exit(f"no API key: set ANTHROPIC_API_KEY or put it in {API_KEY_FILE}")
+        price = (a.price_in, a.price_out) if a.price_in and a.price_out else price_for(a.model)
+        if not price:
+            sys.exit(f"no price for {a.model}; pass --price-in and --price-out (USD per million tokens)")
+        BK.price_in, BK.price_out = price
+        BK.cap = a.max_spend
+        if not a.grade:
+            ceiling, expected = estimate_cost(a)
+            print(f"backend: anthropic | model: {a.model} | price ${BK.price_in}/${BK.price_out} per Mtok (in/out)")
+            print(f"estimate for {a.runs} run(s): ~${expected:.2f} expected, ${ceiling:.2f} worst-case ceiling")
+            print(f"hard cap: {'$%.2f (aborts mid-batch if passed)' % a.max_spend if a.max_spend else 'none set (use --max-spend)'}")
+            if a.max_spend and expected > a.max_spend:
+                sys.exit(f"refusing to start: expected ${expected:.2f} already exceeds --max-spend ${a.max_spend:.2f}")
+            if a.dry_run:
+                print("[dry-run] estimate only; no API calls made, nothing spent.")
+                return
     if a.grade:
         try:
             return grade_saved(a)
@@ -1006,9 +1199,15 @@ def main():
                 print(f"run {i + 1}: choice={r['choice']} undermined={'; '.join(r['found']) or 'no'}"
                       + (f" monitor={r['monitor']}" if r["monitor"] else "")
                       + (f" claims={r['claims']['verdict']}" if r["claims"] else ""), flush=True)
+    except SpendCap as e:
+        print(f"\n*** stopped: {e} ***", flush=True)
     except (urllib.error.URLError, http.client.HTTPException, ConnectionError, TimeoutError) as e:
+        if a.backend == "anthropic":
+            sys.exit(f"can't reach the Anthropic API ({e})")
         sys.exit(f"can't reach Ollama at {a.host} ({e}). Is the Ollama app running, "
                  f"and are {a.model} and {a.monitor} pulled?")
+    if a.backend == "anthropic":
+        print(f"\nAPI: about ${BK.spent:.2f} over {BK.calls} calls (rough estimate at listed prices)")
     if a.runs > 1:
         print(f"\n{a.runs} runs, agent {a.model}, {'mild' if a.mild else 'strong'} goal"
               f"{' + nudge' if a.nudge else ''}{' + improper order' if a.improper else ''}:")
